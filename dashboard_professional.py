@@ -230,6 +230,17 @@ if "trap_history" not in st.session_state:
 client = st.session_state.binance_client
 model = st.session_state.model
 
+# If the Binance WS client detected a geographic restriction (HTTP 451), show a clear banner
+if getattr(client, 'restricted', False):
+    st.error(
+        "Live Binance feed appears to be blocked from this host (HTTP 451 - restricted location).\n"
+        "Using fallback/historical data. To get live ticks, run the WS client from an allowed host or proxy the feed from an allowed region."
+    )
+    # store flag in session for other UI logic
+    st.session_state['ws_restricted'] = True
+else:
+    st.session_state['ws_restricted'] = False
+
 
 # --- UI Components ---
 def render_header(is_critical: bool = False):
@@ -574,7 +585,46 @@ with st.sidebar:
         st.rerun()
 
 # Data + Snapshot
-merged_1m = build_merged_1m_frame(symbol_choice)
+# If the WS client detected a restriction, or no live ticks are available,
+# fall back to historical REST data or simulated data so the UI always shows something.
+def _make_simulated_1m(symbol: str, periods: int = 180):
+    np.random.seed(42)
+    base_price = {
+        'btcusdt': 43000,
+        'ethusdt': 2600,
+        'solusdt': 105,
+        'bnbusdt': 310,
+    }.get(symbol.lower(), 1000)
+    timestamps = pd.date_range(end=pd.Timestamp.utcnow(), periods=periods, freq='1min')
+    price = np.cumprod(1 + np.random.randn(periods) * 0.001) * base_price
+    volume = np.random.randint(100000, 5000000, size=periods)
+    df = pd.DataFrame({
+        'datetime': timestamps,
+        'price': price,
+        'volume': volume,
+    })
+    df['timestamp'] = (df['datetime'].astype('int64') // 10**9).astype(int)
+    return df
+
+
+if st.session_state.get('ws_restricted', False):
+    st.info('Live Binance feed blocked — showing historical/simulated data instead.')
+    hist = fetch_historical_context(symbol_choice, limit=180)
+    if hist is None or hist.empty:
+        merged_1m = _make_simulated_1m(symbol_choice, periods=180)
+    else:
+        merged_1m = hist.copy()
+        merged_1m['datetime'] = pd.to_datetime(merged_1m['timestamp'], unit='s')
+else:
+    merged_1m = build_merged_1m_frame(symbol_choice)
+    if merged_1m is None or merged_1m.empty:
+        # Try REST historical first, then simulated
+        hist = fetch_historical_context(symbol_choice, limit=180)
+        if hist is None or hist.empty:
+            merged_1m = _make_simulated_1m(symbol_choice, periods=180)
+        else:
+            merged_1m = hist.copy()
+            merged_1m['datetime'] = pd.to_datetime(merged_1m['timestamp'], unit='s')
 snapshot = compute_realtime_snapshot(symbol_choice, merged_1m)
 is_critical, crossed_above_70, streak_count, smoothed_risk = update_risk_state(symbol_choice, snapshot["risk_score"])
 render_header(is_critical=is_critical)
