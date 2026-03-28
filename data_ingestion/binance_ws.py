@@ -26,6 +26,9 @@ class BinanceWSClient:
         self.ws: Optional[websocket.WebSocketApp] = None
         self.is_running = False
         self.reconnect_delay = 5
+        # Flag set when Binance rejects connections (e.g. HTTP 451 geographic restriction)
+        self.restricted = False
+        self.last_error = None
         
     def _on_message(self, ws, message):
         try:
@@ -62,10 +65,25 @@ class BinanceWSClient:
             logger.error(f"Error processing WS message: {e}")
 
     def _on_error(self, ws, error):
-        logger.error(f"WebSocket error: {error}")
+        err_str = str(error)
+        logger.error(f"WebSocket error: {err_str}")
+        # Save last error for diagnostics
+        self.last_error = err_str
+
+        # Detect Binance-restricted responses (HTTP 451 / eligibility messages)
+        lower = err_str.lower()
+        if '451' in err_str or 'restricted location' in lower or 'eligibility' in lower:
+            self.restricted = True
+            logger.error("Connection rejected by Binance: restricted location (HTTP 451).")
+        else:
+            # keep previous restricted flag only if we continue to see errors; otherwise clear
+            # but prefer explicit detection above
+            self.restricted = getattr(self, 'restricted', False)
 
     def _on_close(self, ws, close_status_code, close_msg):
         logger.warning(f"WebSocket closed: {close_status_code} - {close_msg}")
+        if getattr(self, 'restricted', False):
+            logger.error("WebSocket closed due to Binance restriction (HTTP 451). No retry will resolve this from this host.")
         if self.is_running:
             logger.info(f"Attempting to reconnect in {self.reconnect_delay} seconds...")
             time.sleep(self.reconnect_delay)
